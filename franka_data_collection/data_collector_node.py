@@ -12,7 +12,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 from std_srvs.srv import Trigger
 from sensor_msgs.msg import Image
 
-from custom_interfaces.msg import RigSnapshot
+from franka_custom_msgs.msg import RigSnapshot
 
 from franka_data_collection.image_buffer import ImageBuffer
 from franka_data_collection.video_encoder import VideoEncoder

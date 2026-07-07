@@ -41,7 +41,7 @@ videos:
 ```
 
 - `topics`: plain ROS topics recorded straight into the rosbag.
-- `videos.topic`: the `custom_interfaces/RigSnapshot` topic providing the synced camera frames to buffer and encode.
+- `videos.topic`: the `franka_custom_msgs/RigSnapshot` topic providing the synced camera frames to buffer and encode.
 
 ## 1.3. Running
 

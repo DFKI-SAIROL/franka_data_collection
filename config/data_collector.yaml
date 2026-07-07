@@ -1,0 +1,31 @@
+node_name: "data_collector"
+storage_path: "/home/csil/projects/bimanual/data/pick_and_stack"
+
+topics:
+  - "/franka_right/franka/joint_states"
+  - "/franka_right/franka_gripper/joint_states"
+  - "/franka_right/mq_debug"
+  - "franka_right/fijk_debug"
+  - "/franka_right/gripper/gripper_controller/joint_trajectory"
+  - "/franka_right/target_pose"
+#  - "/zed_rig/synced_raw_snapshot"
+
+videos:
+  topic: "/zed_rig/synced_raw_snapshot"
+  camera_fps: 30.0
+  cameras:
+    - name: zed_middle
+      type: rgb
+    - name: zed_right
+      type: rgb
+    - name: zed_right_arm
+      type: rgb
+    # Future depth support — uncomment when ready:
+    # - name: depth_front
+    #   type: depth
+    # - name: depth_wrist
+    #   type: depth
+  codec:
+    rgb: h264
+    depth: ffv1        # used when depth cameras are enabled
+    crf: 23 

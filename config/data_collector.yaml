@@ -1,5 +1,5 @@
 node_name: "data_collector"
-storage_path: "/home/csil/projects/bimanual/data/pick_and_stack"
+storage_path: "/home/xiaoqi/projects/data"
 
 topics:
   - "/franka_right/franka/joint_states"

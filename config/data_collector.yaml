@@ -1,31 +1,43 @@
 node_name: "data_collector"
-storage_path: "/home/csil/projects/bimanual/data/pick_and_stack"
+storage_path: "./data"
 
-topics:
-  - "/franka_right/franka/joint_states"
-  - "/franka_right/franka_gripper/joint_states"
-  - "/franka_right/mq_debug"
-  - "franka_right/fijk_debug"
-  - "/franka_right/gripper/gripper_controller/joint_trajectory"
-  - "/franka_right/target_pose"
+# Offered in the labeling window; episodes land in <storage_path>/<task>.
+tasks:
+  - planar-race-track
+labels:
+  - Perfect
+  - Good
+  - Recovery
+  - Failure
+
+# Recorded once per spawned arm; "{arm}" is replaced by the arm namespace
+# (franka_left / franka_right), selected via the spawn_franka_* launch args.
+arm_topics:
+  - "/{arm}/franka/joint_states"
+  - "/{arm}/franka_gripper/joint_states"
+  # Measured torques tau_J are already the effort field of franka/joint_states.
+  # effort = estimated external torques tau_ext_hat_filtered
+  - "/{arm}/franka_robot_state_broadcaster/external_joint_torques"
+  # effort = desired torques tau_J_d (commanded, without gravity)
+  - "/{arm}/franka_robot_state_broadcaster/desired_joint_states"
+  - "/{arm}/mq_debug"
+  - "/{arm}/fijk_debug"
+  - "/{arm}/gripper/gripper_controller/joint_trajectory"
+  - "/{arm}/internal/target_pose"
+
+# Arm-independent topics, recorded as-is.
+topics: []
 #  - "/zed_rig/synced_raw_snapshot"
 
 videos:
-  topic: "/zed_rig/synced_raw_snapshot"
   camera_fps: 30.0
   cameras:
     - name: zed_middle
-      type: rgb
-    - name: zed_right
-      type: rgb
+      rgb_topic: /zed_middle/zed_node/rgb/color/rect/image
     - name: zed_right_arm
-      type: rgb
-    # Future depth support — uncomment when ready:
-    # - name: depth_front
-    #   type: depth
-    # - name: depth_wrist
-    #   type: depth
+      rgb_topic: /zed_right_arm/zed_node/rgb/color/rect/image
+    - name: zed_left_arm
+      rgb_topic: /zed_left_arm/zed_node/rgb/color/rect/image
   codec:
     rgb: h264
-    depth: ffv1        # used when depth cameras are enabled
     crf: 23 

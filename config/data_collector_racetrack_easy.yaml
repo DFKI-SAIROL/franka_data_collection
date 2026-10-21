@@ -1,0 +1,53 @@
+node_name: "data_collector"
+storage_path: "./data"
+
+# Offered in the labeling window; episodes land in <storage_path>/<task>.
+tasks:
+  - planar-race-track
+labels:
+  - Perfect
+  - Good
+  - Recovery
+  - Failure
+
+# Recorded once per spawned arm; "{arm}" is replaced by the arm namespace
+# (franka_left / franka_right), selected via the spawn_franka_* launch args.
+arm_topics:
+  - "/{arm}/franka/joint_states"
+  - "/{arm}/franka_gripper/joint_states"
+  - "/{arm}/franka_robot_state_broadcaster/external_joint_torques"
+  - "/{arm}/franka_robot_state_broadcaster/desired_joint_states"
+  - "/{arm}/mq_debug"
+  - "/{arm}/fijk_debug"
+  - "/{arm}/gripper/gripper_controller/joint_trajectory"
+  - "/{arm}/internal/target_pose"
+
+# Arm-independent topics, recorded as-is.
+topics: []
+
+videos:
+  # ---- mode selection ----
+  # "rig_snapshot": one bundled topic from the aggregator node.
+  # "direct":       one topic per camera, alignment done at dataset-build time.
+  mode: direct
+
+  camera_fps: 50.0
+
+  # Used only when mode == "rig_snapshot"
+  rig_snapshot_topic: /rig_snapshot
+
+  # Order here defines:
+  #  - the order of timestamps_<name>.npy files written
+  #  - which msg.rgbs[i] index each camera maps to in rig_snapshot mode
+  #    (the callback also reorders by msg.camera_names if they differ)
+  cameras:
+    - name: zed_middle
+      rgb_topic: /zed_middle/zed_node/rgb/color/rect/image
+    # - name: zed_right
+    #   rgb_topic: /zed_right/zed_node/rgb/color/rect/image
+    - name: zed_right_arm
+      rgb_topic: /zed_right_arm/zed_node/rgb/color/rect/image
+  codec:
+    rgb: h264          # h264 | h265 | h264_nvenc
+    crf: 23            # quality, lower = better, ignored for nvenc
+    # preset: veryfast   # ultrafast | veryfast | medium | slow ...

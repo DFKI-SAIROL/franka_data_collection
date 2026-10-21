@@ -1,80 +1,65 @@
 import os
-import signal
 import subprocess
-from datetime import datetime
-from pathlib import Path
-import yaml
 
-import numpy as np
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from std_srvs.srv import Trigger
-from sensor_msgs.msg import Image
 
-from franka_custom_msgs.msg import RigSnapshot
+# Episodes are recorded into <storage_path>/_unlabeled and moved to <storage_path>/<task> once labeled.
+from franka_data_collection.episode_writer import (
+    EpisodeWriter, load_collector_config,
+)
 
-from franka_data_collection.image_buffer import ImageBuffer
-from franka_data_collection.video_encoder import VideoEncoder
+from tkinter import StringVar, Tk
+from tkinter import font as tkfont
+from tkinter import ttk
+
+
+def display_zoom() -> float:
+    """The desktop zoom (GNOME on X11 publishes it as Xft.dpi = 96 x zoom, e.g. 192 at 200 %).
+    Read when a dialog opens, so a changed zoom applies to the next one; 1.0 if unknown."""
+    try:
+        out = subprocess.run(['xrdb', '-query'], capture_output=True, text=True, timeout=2).stdout
+        for line in out.splitlines():
+            if line.startswith('Xft.dpi:'):
+                return max(0.5, min(4.0, float(line.split(':', 1)[1]) / 96.0))
+    except Exception:
+        pass
+    return 1.0
+
+
+def apply_zoom(master: Tk, zoom: float) -> None:
+    """Scale a Tk window by the desktop zoom: Tk ignores it and draws at the X server's DPI."""
+    master.tk.call('tk', 'scaling', 96.0 * zoom / 72.0)  # pixels per point: sizes given in points
+    for name in tkfont.names(master):  # Tk's built-in fonts are sized in pixels (negative): scale them too
+        f = tkfont.nametofont(name, root=master)
+        if f.cget('size') < 0:
+            f.configure(size=round(f.cget('size') * zoom))
 
 
 class DataCollector(Node):
     def __init__(self):
         super().__init__('data_collector')
 
-        config_file = os.path.join(os.path.dirname(__file__), '..', 'config', 'data_collector.yaml')
+        self.declare_parameter('config_path', '')
+        self.declare_parameter('arms', ['franka_right'])
 
-        if not config_file:
-            self.get_logger().error('No config_file parameter provided!')
-            return
+        config_file = self.get_parameter('config_path').get_parameter_value().string_value
+        if not config_file or not os.path.isfile(config_file):
+            fallback = os.path.join(os.path.dirname(__file__), '..', 'config', 'data_collector.yaml')
+            if config_file:
+                self.get_logger().warn(f'Config not found at {config_file}, falling back to {fallback}')
+            config_file = fallback
 
-        with open(config_file, 'r') as f:
-            self.config = yaml.safe_load(f)
-
-        # 1. Configuration Setup
-        self.storage_path = Path(self.config.get('storage_path', './data'))
-        self.storage_path.mkdir(parents=True, exist_ok=True)
-        
-        # Assuming your YAML parser just returns a flat list of topic names now
-        self.topics_to_record = self.config.get('topics', None)
-        if self.topics_to_record is None:
-            self.get_logger().error('No topics to record provided!')
-            return
-
-        video_cfg = self.config.get('videos', None)
-        if video_cfg is None:
-            self.get_logger().error('No "videos" section found in config!')
-            return
- 
-        self.video_topic: str = video_cfg['topic']
-        self.camera_fps : flaot = video_cfg['camera_fps']
-        self.camera_names: list[str] = [c['name'] for c in video_cfg['cameras']]
-        self.codec_config: dict = video_cfg.get('codec', {})
-
-        # 2. State Variables
-        self.is_recording = False
-        self.record_process = None
-        self.episode_path = None
-
-        self.image_buffer = ImageBuffer()
-        self.video_encoder = VideoEncoder(
-            camera_names=self.camera_names,
-            codec_config=self.codec_config,
-            fps=self.camera_fps,
+        # Bag, camera frames, labeling files and the move to the task folder: EpisodeWriter,
+        # shared by every writer so they all produce the same layout.
+        arms = list(self.get_parameter('arms').get_parameter_value().string_array_value)
+        self.writer = EpisodeWriter(self, load_collector_config(config_file), arms)
+        self.get_logger().info(
+            f'Recording to {self.writer.unlabeled_dir}; labeled episodes are moved to '
+            f'{self.writer.dataset_root}/<task>.'
         )
-
-        input_qos = QoSProfile(
-            reliability=ReliabilityPolicy.BEST_EFFORT,
-            durability=DurabilityPolicy.VOLATILE,
-            history=HistoryPolicy.KEEP_LAST,
-            depth=5
-        )
-        self.create_subscription(
-            RigSnapshot,
-            self.video_topic,
-            self._camera_sync_callback,
-            qos_profile=input_qos,
-        )
+        self.get_logger().info(f'Recording arms: {arms}')
 
         # 3. Services
         self.srv_trigger = self.create_service(
@@ -83,169 +68,112 @@ class DataCollector(Node):
 
         self.get_logger().info('Data collector ready. Waiting for trigger...')
 
+    @property
+    def is_recording(self) -> bool:
+        return self.writer.is_recording
+
     def recording_callback(self, request, response):
         """Toggles the recording state."""
         if not self.is_recording:
             success, message = self.start_recording()
         else:
             success, message = self.stop_recording()
+            self.label_episode()
 
         response.success = success
         response.message = message
         return response
 
-    def _camera_sync_callback(self, msg) -> None:
-        """
-        Deserialize the synced snapshot message and push frames into the buffer.
- 
-        Expected message fields (from your custom type):
-            header          std_msgs/Header
-            camera_names    string[]
-            cam_infos       sensor_msgs/CameraInfo[]
-            rgbs            sensor_msgs/Image[]
-            depths          sensor_msgs/Image[]   (may be empty)
-        """
-        if not self.image_buffer.is_active:
-            return
- 
-        timestamp_ns = (
-            msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
-        )
- 
-        rgbs = [self._ros_image_to_numpy(img) for img in msg.rgbs]
- 
-        depths = (
-            [self._ros_image_to_numpy_depth(img) for img in msg.depths]
-            if msg.depths
-            else []
-        )
- 
-        self.image_buffer.push(timestamp_ns, rgbs, depths)
-
     def start_recording(self):
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        self.episode_path = self.storage_path / f'episode_{timestamp}'
- 
-        # Rosbag goes into a dedicated subdirectory so it never collides with
-        # the videos/ folder written by the encoder.
-        mcap_path = self.episode_path / 'mcap'
- 
-        command = [
-            'ros2', 'bag', 'record',
-            '-o', str(mcap_path),
-            '-s', 'mcap',
-        ] + self.topics_to_record
- 
-        self.get_logger().info(f'Starting recording to: {self.episode_path}')
- 
         try:
-            self.record_process = subprocess.Popen(command)
-            self.image_buffer.start()
-            self.is_recording = True
-            return True, f"Started recording to {self.episode_path}"
+            path = self.writer.start()
         except Exception as e:
-            self.get_logger().error(f"Failed to start recording: {e}")
-            self.image_buffer.reset()
             return False, str(e)
- 
+        return True, f"Started recording to {path}"
+
     def stop_recording(self):
-        if self.record_process is None:
-            return False, "No active recording process found."
- 
-        self.get_logger().info("Stopping recording...")
- 
-        # Stop the rosbag process gracefully
-        self.record_process.send_signal(signal.SIGINT)
-        self.record_process.wait()
-        self.record_process = None
- 
-        # Stop the image buffer — no more frames will be pushed
-        self.image_buffer.stop()
- 
-        # Drain frames and kick off background encoding
-        frames = self.image_buffer.drain()
-        self.get_logger().info(f"Encoding {len(frames)} frames to video...")
- 
-        if frames:
-            self._encode_async(frames, self.episode_path)
-        else:
-            self.get_logger().warn("No camera frames were buffered — skipping video encoding.")
- 
-        self.is_recording = False
-        self.get_logger().info("Recording stopped. Video encoding running in background.")
-        return True, f"Stopped recording. Encoding {len(frames)} frames."
+        try:
+            n_frames = self.writer.stop()
+        except RuntimeError as e:
+            return False, str(e)
+        return True, f"Stopped recording. Encoding {n_frames} frames."
 
-    def _encode_async(self, frames, episode_path: Path) -> None:
-        """
-        Run video encoding in a background subprocess so the next episode
-        can start recording immediately without waiting for ffmpeg.
- 
-        We serialize the frames to a temporary numpy file and spawn a small
-        helper script.  This avoids any shared-memory or pickle complexity.
-        """
-        import threading
- 
-        def _encode():
-            try:
-                self.video_encoder.encode(frames, episode_path)
-                self.get_logger().info(
-                    f"Video encoding complete: {episode_path / 'videos'}"
-                )
-            except Exception as e:
-                self.get_logger().error(f"Video encoding failed: {e}")
- 
-        t = threading.Thread(target=_encode, daemon=True)
-        t.start()
+    def label_episode(self):
+        """ Open a simple GUI to label the recorded episode with its task and outcome. """
+        print("Labeling episode...", flush=True)
+        episode_path = self.writer.episode_path
 
-    @staticmethod
-    def _ros_image_to_numpy(img: Image) -> 'np.ndarray':
-        """
-        Convert a sensor_msgs/Image to a H×W×3 uint8 numpy array (BGR).
- 
-        Supports encoding strings: ``rgb8``, ``bgr8``, ``rgba8``, ``bgra8``.
-        """
- 
-        data = np.frombuffer(img.data, dtype=np.uint8).reshape(
-            img.height, img.width, -1
+        master = Tk()
+        master.title("Label Episode")
+        zoom = display_zoom()
+        apply_zoom(master, zoom)
+
+        def px(n):  # paddings follow the zoom as well
+            return round(n * zoom)
+
+        # Submit lives in its own bar, packed first at the bottom, so it stays visible even
+        # when the window is smaller than its content.
+        bottom = ttk.Frame(master, padding=(px(25), px(10), px(25), px(20)))
+        bottom.pack(side="bottom", fill="x")
+        main_frame = ttk.Frame(master, padding=(px(25), px(25), px(25), 0))
+        main_frame.pack(side="top", fill="both", expand=True)
+
+        ttk.Label(main_frame, text="Please Label the Recorded Episode", font=("Sans-Serif", 16, "bold")).pack(anchor="w", pady=(0, px(15)))
+        ttk.Label(main_frame, text="Please select the task:", font=("Sans-Serif", 11)).pack(anchor="w", pady=(px(5), px(5)))
+
+        # No preselection: the task decides the folder the episode lands in,
+        # so it must be an explicit choice every time.
+        task_var = StringVar(value="")
+        task_grid = ttk.Frame(main_frame)
+        task_grid.pack(anchor="w", padx=px(10))
+        columns = 3  # the task list is long: a grid keeps the dialog compact
+        for i, task in enumerate(self.writer.tasks):
+            ttk.Radiobutton(task_grid, text=task, variable=task_var, value=task).grid(
+                row=i // columns, column=i % columns, sticky="w", padx=(0, px(20)), pady=px(3))
+
+        ttk.Separator(main_frame, orient="horizontal").pack(fill="x", pady=px(15))
+        ttk.Label(main_frame, text="Please select the label for the task:", font=("Sans-Serif", 11)).pack(anchor="w", pady=(px(5), px(5)))
+
+        label_var = StringVar(value="")
+        label_row = ttk.Frame(main_frame)
+        label_row.pack(anchor="w", padx=px(10))
+        for label in self.writer.labels:
+            ttk.Radiobutton(label_row, text=label, variable=label_var, value=label).pack(side="left", padx=(0, px(20)), pady=px(3))
+
+        submit = ttk.Button(
+            bottom, text="Submit", state="disabled",
+            command=lambda: self.fill_metadata(master, task_var.get(), label_var.get()),
         )
- 
-        encoding = img.encoding.lower()
-        if encoding in ('rgb8', 'rgb'):
-            # OpenCV / ffmpeg expect BGR
-            return data[:, :, ::-1].copy()
-        elif encoding in ('rgba8',):
-            return data[:, :, 2::-1].copy()   # RGBA → BGR
-        elif encoding in ('bgra8',):
-            return data[:, :, :3].copy()       # drop alpha
-        elif encoding in ('bgr8', 'bgr'):
-            return data
-        else:
-            raise ValueError(f"Unsupported RGB encoding: {img.encoding!r}")
+        submit.pack(anchor="center", ipadx=px(15), ipady=px(5))
 
-    @staticmethod
-    def _ros_image_to_numpy_depth(img: Image) -> 'np.ndarray':
-        """
-        Convert a sensor_msgs/Image depth frame to a HxW uint16 numpy array.
- 
-        Supports ``16UC1`` (millimetres, native ZED output) and
-        ``32FC1`` (metres, converted to mm uint16).
-        """
- 
-        encoding = img.encoding.lower()
-        if encoding == '16uc1':
-            return np.frombuffer(img.data, dtype=np.uint16).reshape(
-                img.height, img.width
-            ).copy()
-        elif encoding == '32fc1':
-            # Convert metres → millimetres, clamp to uint16 range
-            f32 = np.frombuffer(img.data, dtype=np.float32).reshape(
-                img.height, img.width
-            )
-            mm = (f32 * 1000.0).clip(0, 65535).astype(np.uint16)
-            return mm
-        else:
-            raise ValueError(f"Unsupported depth encoding: {img.encoding!r}")
+        # Size the window to its content (no fixed geometry that cuts off widgets), capped to the screen
+        master.update_idletasks()
+        width = min(master.winfo_reqwidth(), master.winfo_screenwidth() - 40)
+        height = min(master.winfo_reqheight(), master.winfo_screenheight() - 80)
+        master.geometry(f"{width}x{height}")
+        master.minsize(min(width, px(400)), min(height, px(300)))
 
+        def _update_submit(*_):
+            submit.configure(state="normal" if task_var.get() and label_var.get() else "disabled")
+        task_var.trace_add("write", _update_submit)
+        label_var.trace_add("write", _update_submit)
+
+        def _on_close():
+            self.get_logger().warn(f"Episode not labeled — left in {episode_path}")
+            master.destroy()
+        master.protocol("WM_DELETE_WINDOW", _on_close)
+
+        master.mainloop()
+
+    def fill_metadata(self, master, task, label):
+        """
+        Save the metadata for the recorded episode to a YAML file and move the
+        episode into its task folder."""
+
+        print(f"Submitted -> Task: {task} | Label: {label}", flush=True)
+        master.destroy()
+        self.writer.finish(task, label)
+        return 0
 
 def main(args=None):
     rclpy.init(args=args)

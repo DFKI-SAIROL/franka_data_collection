@@ -1,36 +1,44 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from threading import Lock
-from typing import Optional
 
 import numpy as np
 
 
 @dataclass
-class CameraFrame:
-    """One time-stamped snapshot from all cameras in a synced message."""
-    timestamp_ns: int
-    rgbs: list[np.ndarray]        # list of H×W×3 uint8, one per camera
-    depths: list[np.ndarray]      # list of H×W uint16, one per camera (may be empty)
+class CameraStream:
+    """Accumulated frames + timestamps for one camera."""
+    timestamps_ns: list[int]
+    frames: list[np.ndarray]   # H×W×3 uint8 (BGR)
+
+    def __len__(self) -> int:
+        return len(self.frames)
 
 
 class ImageBuffer:
     """
-    Thread-safe accumulator for synced camera frames.
+    Thread-safe per-camera accumulator for RGB frames.
+
+    Each camera has its own independent stream of (timestamp, frame) pairs.
+    Cameras are NOT aligned in this buffer — alignment is a dataset-build
+    step performed later using the saved per-camera timestamp files.
 
     Lifecycle
     ---------
     start()  → begin accepting frames
-    push()   → called from the ROS subscriber callback
+    push()   → called from a ROS subscriber callback (one camera at a time)
     stop()   → stop accepting frames
-    drain()  → retrieve all accumulated frames and reset
+    drain()  → retrieve all per-camera streams and clear
 
-    The buffer stores frames as raw numpy arrays.  Encoding to video is
-    handled separately by VideoEncoder so that the ROS spin-loop is never
-    blocked by I/O.
+    Encoding to video is handled separately by VideoEncoder so that the
+    ROS spin-loop is never blocked by I/O.
     """
 
-    def __init__(self) -> None:
-        self._frames: list[CameraFrame] = []
+    def __init__(self, camera_names: list[str]) -> None:
+        self.camera_names = list(camera_names)
+        self._streams: dict[str, CameraStream] = {
+            name: CameraStream(timestamps_ns=[], frames=[])
+            for name in self.camera_names
+        }
         self._lock = Lock()
         self._active = False
 
@@ -40,7 +48,9 @@ class ImageBuffer:
 
     def start(self) -> None:
         with self._lock:
-            self._frames.clear()
+            for stream in self._streams.values():
+                stream.timestamps_ns.clear()
+                stream.frames.clear()
             self._active = True
 
     def stop(self) -> None:
@@ -50,7 +60,9 @@ class ImageBuffer:
     def reset(self) -> None:
         """Drop all buffered frames without returning them."""
         with self._lock:
-            self._frames.clear()
+            for stream in self._streams.values():
+                stream.timestamps_ns.clear()
+                stream.frames.clear()
             self._active = False
 
     # ------------------------------------------------------------------
@@ -59,61 +71,64 @@ class ImageBuffer:
 
     def push(
         self,
+        camera_name: str,
         timestamp_ns: int,
-        rgbs: list[np.ndarray],
-        depths: Optional[list[np.ndarray]] = None,
+        frame: np.ndarray,
     ) -> None:
         """
-        Store one synced frame.  Silently dropped when the buffer is not active.
+        Store one frame from one camera.  Silently dropped when inactive.
 
         Parameters
         ----------
+        camera_name:
+            Name of the camera the frame came from.  Must match one of the
+            names passed to ``__init__``.
         timestamp_ns:
-            Header stamp in nanoseconds (sec * 1e9 + nanosec).
-        rgbs:
-            One HxWx3 uint8 array per camera, in the same order as
-            ``camera_names`` in the ROS message.
-        depths:
-            One HxW uint16 array per camera.  Pass None or an empty list
-            when depth is not recorded.
+            Header stamp in nanoseconds.
+        frame:
+            H×W×3 uint8 BGR array.
         """
         if not self._active:
             return
+        if camera_name not in self._streams:
+            raise KeyError(
+                f"Unknown camera '{camera_name}'. Known: {self.camera_names}"
+            )
 
-        frame = CameraFrame(
-            timestamp_ns=timestamp_ns,
-            rgbs=rgbs,
-            depths=depths or [],
-        )
         with self._lock:
-            if self._active:          # re-check under lock
-                self._frames.append(frame)
+            if not self._active:        # re-check under lock
+                return
+            stream = self._streams[camera_name]
+            stream.timestamps_ns.append(timestamp_ns)
+            stream.frames.append(frame)
 
-    # ------------------------------------------------------------------
-    # Data retrieval
-    # ------------------------------------------------------------------
-
-    def drain(self) -> list[CameraFrame]:
+    def drain(self) -> dict[str, CameraStream]:
         """
-        Return all accumulated frames and clear the internal list.
+        Return all per-camera streams and clear the internal buffers.
 
-        Safe to call after ``stop()``.  The buffer is left empty but not
-        reset — call ``reset()`` explicitly if you want to discard frames
-        without inspecting them.
+        Safe to call after ``stop()``.  The buffer is left empty.
         """
         with self._lock:
-            frames = list(self._frames)
-            self._frames.clear()
-        return frames
+            out = {
+                name: CameraStream(
+                    timestamps_ns=list(stream.timestamps_ns),
+                    frames=list(stream.frames),
+                )
+                for name, stream in self._streams.items()
+            }
+            for stream in self._streams.values():
+                stream.timestamps_ns.clear()
+                stream.frames.clear()
+        return out
 
     # ------------------------------------------------------------------
     # Diagnostics
     # ------------------------------------------------------------------
 
-    @property
-    def size(self) -> int:
+    def sizes(self) -> dict[str, int]:
+        """Per-camera frame counts (for logging)."""
         with self._lock:
-            return len(self._frames)
+            return {name: len(s.frames) for name, s in self._streams.items()}
 
     @property
     def is_active(self) -> bool:

@@ -7,7 +7,9 @@ import yaml
 
 import numpy as np
 import rclpy
+from rclpy.exceptions import ParameterUninitializedException
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from std_srvs.srv import Trigger
 from sensor_msgs.msg import Image
@@ -76,6 +78,10 @@ class DataCollector(Node):
             qos_profile=input_qos,
         )
 
+        # Topics recorded on top of `topics`, settable at runtime (e.g. by the studio's observation
+        # space: `ros2 param set /data_collector extra_topics "['/ffs/points']"`); read at each start.
+        self.declare_parameter('extra_topics', Parameter.Type.STRING_ARRAY)
+
         # 3. Services
         self.srv_trigger = self.create_service(
             Trigger, '~/record_data_trigger', self.recording_callback
@@ -130,13 +136,20 @@ class DataCollector(Node):
         # the videos/ folder written by the encoder.
         mcap_path = self.episode_path / 'mcap'
  
+        try:
+            extra = [t for t in (self.get_parameter('extra_topics').value or []) if t]
+        except ParameterUninitializedException:
+            extra = []
+        topics = list(dict.fromkeys(self.topics_to_record + extra))
+
         command = [
             'ros2', 'bag', 'record',
             '-o', str(mcap_path),
             '-s', 'mcap',
-        ] + self.topics_to_record
+        ] + topics
  
-        self.get_logger().info(f'Starting recording to: {self.episode_path}')
+        self.get_logger().info(f'Starting recording to: {self.episode_path}'
+                               + (f' (extra topics: {", ".join(extra)})' if extra else ''))
  
         try:
             self.record_process = subprocess.Popen(command)

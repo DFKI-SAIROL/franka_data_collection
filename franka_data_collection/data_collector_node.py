@@ -1,6 +1,7 @@
 import os
 import signal
 import subprocess
+import shutil
 from datetime import datetime
 from pathlib import Path
 import yaml
@@ -22,14 +23,12 @@ class DataCollector(Node):
     def __init__(self):
         super().__init__('data_collector')
 
-        config_file = os.path.join(os.path.dirname(__file__), '..', 'config', 'data_collector.yaml')
-
-        if not config_file:
-            self.get_logger().error('No config_file parameter provided!')
-            return
+        default_config = Path(__file__).resolve().parents[1] / 'config' / 'data_collector.yaml'
+        config_file = Path(self.declare_parameter('config_path', str(default_config)).value).expanduser()
 
         with open(config_file, 'r') as f:
             self.config = yaml.safe_load(f)
+        self.config_dir = config_file.resolve().parent
 
         # 1. Configuration Setup
         self.storage_path = Path(self.config.get('storage_path', './data'))
@@ -47,14 +46,30 @@ class DataCollector(Node):
             return
  
         self.video_topic: str = video_cfg['topic']
-        self.camera_fps : flaot = video_cfg['camera_fps']
+        self.camera_fps: float = video_cfg['camera_fps']
         self.camera_names: list[str] = [c['name'] for c in video_cfg['cameras']]
         self.codec_config: dict = video_cfg.get('codec', {})
+        # Calibrated cameras: every camera with a non-empty videos.extrinsics entry. Their extrinsics and CameraInfo
+        # are stored with each episode; a camera without an entry is recorded without calibration.
+        extrinsics_cfg = video_cfg.get('extrinsics') or {}
+        self.pose_camera_names = tuple(name for name, path in extrinsics_cfg.items() if path)
+        if not self.pose_camera_names:
+            raise ValueError('videos.extrinsics must name at least one calibrated camera')
+        unknown = set(self.pose_camera_names) - set(self.camera_names)
+        if unknown:
+            raise ValueError(f'videos.extrinsics names cameras missing from videos.cameras: {sorted(unknown)}')
+        self.extrinsic_paths = {
+            name: self._configured_extrinsic_path(extrinsics_cfg[name]) for name in self.pose_camera_names
+        }
+        self.get_logger().info(f'Calibrated cameras: {list(self.pose_camera_names)}')
 
         # 2. State Variables
         self.is_recording = False
         self.record_process = None
         self.episode_path = None
+        self.saved_camera_infos = set()
+        self.expected_camera_frames = {}
+        self.calibration_error = None
 
         self.image_buffer = ImageBuffer()
         self.video_encoder = VideoEncoder(
@@ -107,6 +122,44 @@ class DataCollector(Node):
         """
         if not self.image_buffer.is_active:
             return
+        if (len(msg.camera_names) != len(msg.rgbs)
+                or len(msg.camera_names) != len(msg.cam_infos)
+                or len(msg.camera_names) != len(msg.depths)):
+            self.calibration_error = 'RigSnapshot camera_names, rgbs, depths and cam_infos lengths differ'
+            self.get_logger().error(self.calibration_error)
+            return
+        if tuple(msg.camera_names) != tuple(self.camera_names):
+            self.calibration_error = 'RigSnapshot camera order differs from videos.cameras configuration'
+            self.get_logger().error(self.calibration_error)
+            return
+        for name in self.pose_camera_names:
+            index = msg.camera_names.index(name)
+            info, rgb = msg.cam_infos[index], msg.rgbs[index]
+            depth = msg.depths[index]
+            if (info.width, info.height) != (rgb.width, rgb.height) or not info.header.frame_id:
+                self.calibration_error = f'{name}: CameraInfo size/frame_id does not match the RGB image'
+                self.get_logger().error(self.calibration_error)
+                return
+            if (depth.width, depth.height) != (rgb.width, rgb.height):
+                self.calibration_error = f'{name}: depth dimensions do not match RGB image'
+                self.get_logger().error(self.calibration_error)
+                return
+            if info.header.frame_id != self.expected_camera_frames[name]:
+                self.calibration_error = f'{name}: CameraInfo frame_id differs from calibrated child_frame'
+                self.get_logger().error(self.calibration_error)
+                return
+            if not all(np.isfinite(info.k)) or info.k[0] <= 0 or info.k[4] <= 0:
+                self.calibration_error = f'{name}: invalid CameraInfo K matrix'
+                self.get_logger().error(self.calibration_error)
+                return
+            if name not in self.saved_camera_infos:
+                try:
+                    self._save_camera_info(name, info)
+                except OSError as exc:
+                    self.calibration_error = f'{name}: failed to save CameraInfo: {exc}'
+                    self.get_logger().error(self.calibration_error)
+                    return
+                self.saved_camera_infos.add(name)
  
         timestamp_ns = (
             msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
@@ -123,8 +176,33 @@ class DataCollector(Node):
         self.image_buffer.push(timestamp_ns, rgbs, depths)
 
     def start_recording(self):
+        try:
+            extrinsics = {name: self._load_extrinsic(name) for name in self.pose_camera_names}
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            return False, f'Camera extrinsic calibration is unavailable: {exc}'
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         self.episode_path = self.storage_path / f'episode_{timestamp}'
+        if self.episode_path.exists():
+            return False, f'Episode directory already exists: {self.episode_path}'
+        calibration_dir = self.episode_path / 'calibration'
+        calibration_dir.mkdir(parents=True)
+        try:
+            for name in self.pose_camera_names:
+                shutil.copyfile(self.extrinsic_paths[name], calibration_dir / f'{name}_extrinsic.yaml')
+            with (calibration_dir / 'depth_format.yaml').open('w') as stream:
+                yaml.safe_dump({
+                    'stored_encoding': 'gray16le_uint16_mm',
+                    'scale_to_meters': 0.001,
+                    'invalid_values': [0, 65535],
+                    'registered_to_rgb': True,
+                }, stream, sort_keys=False)
+        except OSError as exc:
+            return False, f'Failed to save episode calibration: {exc}'
+        self.expected_camera_frames = {
+            name: extrinsics[name]['child_frame'] for name in self.pose_camera_names
+        }
+        self.saved_camera_infos = set()
+        self.calibration_error = None
  
         # Rosbag goes into a dedicated subdirectory so it never collides with
         # the videos/ folder written by the encoder.
@@ -161,6 +239,7 @@ class DataCollector(Node):
  
         # Stop the image buffer — no more frames will be pushed
         self.image_buffer.stop()
+        missing = set(self.pose_camera_names) - self.saved_camera_infos
  
         # Drain frames and kick off background encoding
         frames = self.image_buffer.drain()
@@ -172,8 +251,57 @@ class DataCollector(Node):
             self.get_logger().warn("No camera frames were buffered — skipping video encoding.")
  
         self.is_recording = False
+        if missing or self.calibration_error:
+            problem = self.calibration_error or f'Missing CameraInfo for: {sorted(missing)}'
+            self.get_logger().error(f'Episode calibration incomplete: {problem}')
+            return False, f'Recording stopped; episode calibration incomplete: {problem}'
         self.get_logger().info("Recording stopped. Video encoding running in background.")
         return True, f"Stopped recording. Encoding {len(frames)} frames."
+
+    def _configured_extrinsic_path(self, value):
+        if not value:
+            return None
+        path = Path(os.path.expandvars(value)).expanduser()
+        return path if path.is_absolute() else self.config_dir / path
+
+    def _load_extrinsic(self, name):
+        path = self.extrinsic_paths[name]
+        if path is None or not path.is_file():
+            raise ValueError(f'{name}: set videos.extrinsics.{name} to an existing calibrated YAML file')
+        with path.open() as stream:
+            data = yaml.safe_load(stream)
+        if not isinstance(data, dict) or not data.get('parent_frame') or not data.get('child_frame'):
+            raise ValueError(f'{path}: parent_frame and child_frame are required')
+        translation = np.asarray(data.get('translation_m'), dtype=float)
+        quaternion = np.asarray(data.get('quaternion_xyzw'), dtype=float)
+        if translation.shape != (3,) or quaternion.shape != (4,):
+            raise ValueError(f'{path}: expected translation_m[3] and quaternion_xyzw[4]')
+        if not np.all(np.isfinite(translation)) or not np.all(np.isfinite(quaternion)):
+            raise ValueError(f'{path}: transform contains non-finite values')
+        if not np.isclose(np.linalg.norm(quaternion), 1.0, atol=0.01):
+            raise ValueError(f'{path}: quaternion_xyzw must have unit length')
+        return data
+
+    def _save_camera_info(self, name, info):
+        roi = info.roi
+        record = {
+            'frame_id': info.header.frame_id,
+            'width': int(info.width), 'height': int(info.height),
+            'distortion_model': info.distortion_model,
+            'd': [float(v) for v in info.d],
+            'k': [float(v) for v in info.k],
+            'r': [float(v) for v in info.r],
+            'p': [float(v) for v in info.p],
+            'binning_x': int(info.binning_x), 'binning_y': int(info.binning_y),
+            'roi': {
+                'x_offset': int(roi.x_offset), 'y_offset': int(roi.y_offset),
+                'height': int(roi.height), 'width': int(roi.width),
+                'do_rectify': bool(roi.do_rectify),
+            },
+        }
+        path = self.episode_path / 'calibration' / f'{name}_camera_info.yaml'
+        with path.open('w') as stream:
+            yaml.safe_dump(record, stream, sort_keys=False)
 
     def _encode_async(self, frames, episode_path: Path) -> None:
         """

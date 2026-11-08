@@ -88,11 +88,10 @@ Each triggered episode is written under `storage_path` as:
 ```
 episode_<timestamp>/
 ├── mcap/                     # rosbag with the configured topics
-├── calibration/
-│   ├── zed_middle_camera_info.yaml
-│   ├── zed_middle_extrinsic.yaml
-│   ├── zed_right_camera_info.yaml
-│   ├── zed_right_extrinsic.yaml
+├── calibration/              # for every camera with a videos.extrinsics entry:
+│   ├── <camera>_camera_info.yaml
+│   ├── <camera>_cam_K.txt     # 3x3 intrinsic matrix (camera_matrix_file of 6dposeestimationtracking)
+│   ├── <camera>_extrinsic.yaml
 │   └── depth_format.yaml
 └── videos/
     ├── timestamps.npy        # int64 ns, one per synced frame

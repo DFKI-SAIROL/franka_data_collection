@@ -302,6 +302,9 @@ class DataCollector(Node):
         path = self.episode_path / 'calibration' / f'{name}_camera_info.yaml'
         with path.open('w') as stream:
             yaml.safe_dump(record, stream, sort_keys=False)
+        # Plain 3x3 intrinsic matrix, the camera_matrix_file format of 6dposeestimationtracking
+        np.savetxt(self.episode_path / 'calibration' / f'{name}_cam_K.txt',
+                   np.asarray(info.k, dtype=float).reshape(3, 3), fmt='%.10g')
 
     def _encode_async(self, frames, episode_path: Path) -> None:
         """

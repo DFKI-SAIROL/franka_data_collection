@@ -31,8 +31,15 @@ topics:
 videos:
   topic: "/zed_rig/synced_raw_snapshot"
   camera_fps: 30.0
+  extrinsics:
+    zed_middle: "/path/to/measured/zed_middle.yaml"
+    zed_right: "/path/to/measured/zed_right.yaml"
   cameras:
     - name: zed_middle
+      type: rgb
+    - name: zed_right
+      type: rgb
+    - name: zed_right_arm
       type: rgb
   codec:
     rgb: h264
@@ -42,6 +49,18 @@ videos:
 
 - `topics`: plain ROS topics recorded straight into the rosbag.
 - `videos.topic`: the `franka_custom_msgs/RigSnapshot` topic providing the synced camera frames to buffer and encode.
+- `videos.extrinsics.<camera>`: paths to measured fixed camera transforms. Every camera with a non-empty entry is treated as calibrated: recording refuses to start until its file exists, and its extrinsic and CameraInfo are stored with each episode. Cameras with an empty or no entry are recorded without calibration; at least one entry is required. Relative paths are resolved from the config file directory.
+
+Each extrinsic YAML must describe `T_parent_child`, mapping points from the camera optical frame into the robot base frame, with metres and ROS `xyzw` quaternion order:
+
+```yaml
+parent_frame: franka_right_link0  # replace with the actual calibrated base frame
+child_frame: zed_middle_left_camera_optical_frame  # match CameraInfo.header.frame_id
+translation_m: [0.0, 0.0, 0.0]  # replace with measured values
+quaternion_xyzw: [0.0, 0.0, 0.0, 1.0]  # replace with measured values
+```
+
+The collector checks the CameraInfo frame ID and dimensions against the calibration and RGB stream. These example numeric values are only a format illustration, not a camera calibration.
 
 ## 1.3. Running
 
@@ -69,6 +88,11 @@ Each triggered episode is written under `storage_path` as:
 ```
 episode_<timestamp>/
 ├── mcap/                     # rosbag with the configured topics
+├── calibration/              # for every camera with a videos.extrinsics entry:
+│   ├── <camera>_camera_info.yaml
+│   ├── <camera>_cam_K.txt     # 3x3 intrinsic matrix (camera_matrix_file of 6dposeestimationtracking)
+│   ├── <camera>_extrinsic.yaml
+│   └── depth_format.yaml
 └── videos/
     ├── timestamps.npy        # int64 ns, one per synced frame
     ├── rgb_<camera_name>.mp4

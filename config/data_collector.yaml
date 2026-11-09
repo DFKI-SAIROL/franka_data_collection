@@ -1,7 +1,9 @@
 node_name: "data_collector"
-storage_path: "/home/csil/projects/bimanual/data/pick_and_stack"
+storage_path: "/home/xiaoqi/projects/data"
 
 topics:
+  - "/franka_left/franka/joint_states"
+  - "/franka_left/franka_gripper/joint_states"
   - "/franka_right/franka/joint_states"
   - "/franka_right/franka_gripper/joint_states"
   - "/franka_right/mq_debug"
@@ -13,6 +15,11 @@ topics:
 videos:
   topic: "/zed_rig/synced_raw_snapshot"
   camera_fps: 30.0
+  # Paths to measured, fixed T_parent_child transforms. Relative paths use this YAML's directory.
+  # Recording will refuse to start until both files exist and pass validation.
+  extrinsics:
+    zed_middle: ""
+    zed_right: ""
   cameras:
     - name: zed_middle
       type: rgb
@@ -28,4 +35,4 @@ videos:
   codec:
     rgb: h264
     depth: ffv1        # used when depth cameras are enabled
-    crf: 23 
+    crf: 23

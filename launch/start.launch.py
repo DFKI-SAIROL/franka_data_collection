@@ -1,7 +1,4 @@
 from launch import LaunchDescription
-from launch_ros.actions import Node
-
-from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction, SetEnvironmentVariable
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
@@ -29,7 +26,7 @@ def generate_launch_description():
         DeclareLaunchArgument(
             "config_path",
             default_value=PathJoinSubstitution([
-                FindPackageShare('franka_data_collection'), 'config', 'data_collection_config.yaml'
+                FindPackageShare('franka_data_collection'), 'config', 'data_collector.yaml'
             ]),
             description="Path to the data collection config file",
         ),

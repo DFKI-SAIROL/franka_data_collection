@@ -34,7 +34,7 @@ class DataCollector(Node):
             self.config = yaml.safe_load(f)
 
         # 1. Configuration Setup
-        self.storage_path = Path(self.config.get('storage_path', './data'))
+        self.storage_path = Path(self.config.get('storage_path', './data')).expanduser()
         self.storage_path.mkdir(parents=True, exist_ok=True)
         
         # Assuming your YAML parser just returns a flat list of topic names now

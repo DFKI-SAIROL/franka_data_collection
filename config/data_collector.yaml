@@ -1,24 +1,32 @@
 node_name: "data_collector"
-storage_path: "/home/csil/projects/bimanual/data/pick_and_stack"
+# Raw episodes; the studio moves them to <data_root>/<dataset>/<task>/ (keep on the same disk).
+storage_path: "~/data/collector"
 
 topics:
   - "/franka_right/franka/joint_states"
   - "/franka_right/franka_gripper/joint_states"
   - "/franka_right/mq_debug"
-  - "franka_right/fijk_debug"
+  - "/franka_right/fijk_debug"
   - "/franka_right/gripper/gripper_controller/joint_trajectory"
   - "/franka_right/target_pose"
+  - "/franka_left/franka/joint_states"
+  - "/franka_left/franka_gripper/joint_states"
+  - "/franka_left/mq_debug"
+  - "/franka_left/fijk_debug"
+  - "/franka_left/gripper/gripper_controller/joint_trajectory"
+  - "/franka_left/target_pose"
 #  - "/zed_rig/synced_raw_snapshot"
 
 videos:
   topic: "/zed_rig/synced_raw_snapshot"
   camera_fps: 30.0
+  # Same order as the rig in config/cameras.yaml (frames are named by index).
   cameras:
     - name: zed_middle
       type: rgb
-    - name: zed_right
-      type: rgb
     - name: zed_right_arm
+      type: rgb
+    - name: zed_left_arm
       type: rgb
     # Future depth support — uncomment when ready:
     # - name: depth_front

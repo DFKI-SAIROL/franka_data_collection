@@ -79,7 +79,7 @@ class DataCollector(Node):
         self.get_logger().info(f'Recording arms: {arms}')
 
         # label_dialog false = headless: stopping opens no window, and the stopped episode waits
-        # for ~/finish_episode (task, label, metadata) or ~/discard_episode, e.g. from Franka Studio.
+        # for ~/finish_episode (task, label, metadata) or ~/discard_episode from a client.
         self.declare_parameter('label_dialog', True)
         self.label_dialog = self.get_parameter('label_dialog').get_parameter_value().bool_value
         # The labels a finish_episode request may use, for clients to offer

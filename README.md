@@ -65,7 +65,8 @@ ros2 service call /data_collector/record_data_trigger std_srvs/srv/Trigger
 ```
 
 Stopping opens a window to choose the episode's task and label. With `label_dialog:=false` the
-node runs headless (e.g. under Franka Studio): the stopped episode waits for one of
+node runs headless, for a client that labels the episodes itself: the stopped episode waits
+for one of
 
 ```bash
 # file it below storage_path/<task> (task may be nested, e.g. "<dataset>/<task>"); metadata is

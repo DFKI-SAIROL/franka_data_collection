@@ -62,7 +62,7 @@ def generate_launch_description():
             "label_dialog",
             default_value="true",
             description="Open the labelling window after each episode; false: label through "
-                        "~/finish_episode / ~/discard_episode (Franka Studio)",
+                        "~/finish_episode / ~/discard_episode",
         ),
         DeclareLaunchArgument(
             "storage_path",

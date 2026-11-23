@@ -62,6 +62,22 @@ Recording is toggled by calling the trigger service — the first call starts it
 ros2 service call /data_collector/record_data_trigger std_srvs/srv/Trigger
 ```
 
+Stopping opens a window to choose the episode's task and label. With `label_dialog:=false` the
+node runs headless (e.g. under Franka Studio): the stopped episode waits for one of
+
+```bash
+# file it below storage_path/<task> (task may be nested, e.g. "<dataset>/<task>"); metadata is
+# an optional YAML mapping stored as mcap/episode_info.yaml
+ros2 service call /data_collector/finish_episode franka_custom_msgs/srv/FinishEpisode \
+  "{task: 'my_dataset/pick-cup', label: 'Good', metadata: 'operator: jane'}"
+ros2 service call /data_collector/discard_episode std_srvs/srv/Trigger
+```
+
+and a new recording is refused until then. The valid labels are the node's read-only `labels`
+parameter (from the config). An episode labeled `garbage_label` (`Garbage`) is filed below
+`garbage_dir` (default `<storage_path>/_garbage/<task>`) instead of `<storage_path>/<task>`: kept,
+but out of the datasets.
+
 ## 1.4. Output Layout
 
 Each triggered episode is written under `storage_path` as:

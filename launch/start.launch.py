@@ -27,7 +27,8 @@ def generate_data_collector_node(context):
         executable='data_collector_main',
         name='data_collector',
         output='screen',
-        parameters=[{'config_path': config_path, 'arms': arms}],
+        parameters=[{'config_path': config_path, 'arms': arms,
+                     'label_dialog': LaunchConfiguration('label_dialog').perform(context).lower() == 'true'}],
     )]
 
 
@@ -55,6 +56,12 @@ def generate_launch_description():
             "spawn_franka_right",
             default_value="true",
             description="Record franka right",
+        ),
+        DeclareLaunchArgument(
+            "label_dialog",
+            default_value="true",
+            description="Open the labelling window after each episode; false: label through "
+                        "~/finish_episode / ~/discard_episode (Franka Studio)",
         ),
         OpaqueFunction(function=generate_data_collector_node),
     ])

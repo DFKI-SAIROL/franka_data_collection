@@ -1,9 +1,18 @@
+import json
 import os
 import subprocess
+import time
+from pathlib import PurePosixPath
 
 import rclpy
+import yaml
+from rcl_interfaces.msg import ParameterDescriptor
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from std_msgs.msg import String
 from std_srvs.srv import Trigger
+
+from franka_custom_msgs.srv import FinishEpisode
 
 # Episodes are recorded into <storage_path>/_unlabeled and moved to <storage_path>/<task> once labeled.
 from franka_data_collection.episode_writer import (
@@ -57,20 +66,45 @@ class DataCollector(Node):
         self.writer = EpisodeWriter(self, load_collector_config(config_file), arms)
         self.get_logger().info(
             f'Recording to {self.writer.unlabeled_dir}; labeled episodes are moved to '
-            f'{self.writer.dataset_root}/<task>.'
+            f'{self.writer.dataset_root}/<task>'
+            + (f', {self.writer.garbage_label} ones to {self.writer.garbage_root}/<task>.'
+               if self.writer.garbage_label else '.')
         )
         self.get_logger().info(f'Recording arms: {arms}')
+
+        # label_dialog false = headless: stopping opens no window, and the stopped episode waits
+        # for ~/finish_episode (task, label, metadata) or ~/discard_episode, e.g. from Franka Studio.
+        self.declare_parameter('label_dialog', True)
+        self.label_dialog = self.get_parameter('label_dialog').get_parameter_value().bool_value
+        # The labels a finish_episode request may use, for clients to offer
+        self.declare_parameter('labels', self.writer.labels, ParameterDescriptor(read_only=True))
 
         # 3. Services
         self.srv_trigger = self.create_service(
             Trigger, '~/record_data_trigger', self.recording_callback
         )
+        self.srv_finish = self.create_service(FinishEpisode, '~/finish_episode', self.finish_callback)
+        self.srv_discard = self.create_service(Trigger, '~/discard_episode', self.discard_callback)
 
-        self.get_logger().info('Data collector ready. Waiting for trigger...')
+        # ~/status (latched): JSON {state: idle | recording | stopped (waits for its label),
+        # episode, stamp}, on every change. Lets a client follow recordings toggled by anyone else
+        # (the teleop's A button calls record_data_trigger directly).
+        self.status_pub = self.create_publisher(String, '~/status', QoSProfile(
+            depth=1, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        self.publish_status()
+
+        mode ='labelling window' if self.label_dialog else 'headless (finish_episode / discard_episode)'
+        self.get_logger().info(f'Data collector ready ({mode}). Waiting for trigger...')
 
     @property
     def is_recording(self) -> bool:
         return self.writer.is_recording
+
+    def publish_status(self):
+        w = self.writer
+        state = 'recording' if w.is_recording else 'stopped' if w.pending else 'idle'
+        self.status_pub.publish(String(data=json.dumps(
+            {'state': state, 'episode': str(w.episode_path or ''), 'stamp': time.time()})))
 
     def recording_callback(self, request, response):
         """Toggles the recording state."""
@@ -78,25 +112,69 @@ class DataCollector(Node):
             success, message = self.start_recording()
         else:
             success, message = self.stop_recording()
-            self.label_episode()
+            if self.label_dialog:
+                self.label_episode()
 
         response.success = success
         response.message = message
         return response
 
+    def finish_callback(self, request, response):
+        """Labels the stopped episode and files it below <storage_path>/<task> (headless)."""
+        try:
+            task = self._task_folder(request.task)
+            if request.label not in self.writer.labels:
+                raise ValueError(f'Unknown label {request.label!r} (one of {", ".join(self.writer.labels)}).')
+            metadata = yaml.safe_load(request.metadata) if request.metadata.strip() else None
+            if metadata is not None and not isinstance(metadata, dict):
+                raise ValueError('metadata must be a YAML mapping.')
+            target = self.writer.finish(task, request.label,
+                                        {'episode_info.yaml': metadata} if metadata else None)
+        except (ValueError, RuntimeError, yaml.YAMLError) as e:
+            response.success, response.message = False, str(e)
+            return response
+        self.publish_status()
+        response.success, response.path = True, str(target)
+        response.message = f'Labeled {request.label}; moving to {target} once its videos are written.'
+        return response
+
+    def discard_callback(self, request, response):
+        """Deletes the stopped, not yet labeled episode (once its videos are written)."""
+        try:
+            path = self.writer.discard()
+        except RuntimeError as e:
+            response.success, response.message = False, str(e)
+            return response
+        self.publish_status()
+        response.success, response.message = True, f'Discarding {path}.'
+        return response
+
+    @staticmethod
+    def _task_folder(task: str) -> str:
+        """The task as a relative folder below storage_path; ValueError if it would leave it."""
+        path = PurePosixPath(task.strip())
+        if not path.parts or path.is_absolute() or any(p in ('.', '..') for p in path.parts):
+            raise ValueError(f'Invalid task folder {task!r}: a relative path below storage_path.')
+        return str(path)
+
     def start_recording(self):
+        # Headless, nobody else would ever label the stopped episode: it must not be replaced
+        if not self.label_dialog and self.writer.pending:
+            return False, f'Label or discard the last episode first ({self.writer.episode_path}).'
         try:
             path = self.writer.start()
         except Exception as e:
             return False, str(e)
+        self.publish_status()
         return True, f"Started recording to {path}"
 
     def stop_recording(self):
         try:
-            n_frames = self.writer.stop()
+            n_cameras = self.writer.stop()
         except RuntimeError as e:
             return False, str(e)
-        return True, f"Stopped recording. Encoding {n_frames} frames."
+        self.publish_status()
+        return True, f"Stopped recording. Encoding the videos of {n_cameras} cameras."
 
     def label_episode(self):
         """ Open a simple GUI to label the recorded episode with its task and outcome. """
@@ -173,6 +251,7 @@ class DataCollector(Node):
         print(f"Submitted -> Task: {task} | Label: {label}", flush=True)
         master.destroy()
         self.writer.finish(task, label)
+        self.publish_status()
         return 0
 
 def main(args=None):

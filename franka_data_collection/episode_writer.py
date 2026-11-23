@@ -6,7 +6,8 @@ all produce exactly the same thing:
         videos/    rgb_<cam>.mp4 + timestamps*.npy from the camera-rig snapshots
 
 Episodes are recorded into <storage_path>/_unlabeled and moved to their task folder once labeled and
-their videos are written (same filesystem, so the move is an atomic rename).
+their videos are written (same filesystem, so the move is an atomic rename). An episode labeled
+garbage_label goes to <garbage_dir>/<task><suffix> instead: kept, but out of every dataset.
 """
 import shutil
 import signal
@@ -27,6 +28,7 @@ from franka_data_collection.video_encoder import VideoEncoder
 # Defaults; override per deployment via storage_path / tasks / labels in the collector config.
 DEFAULT_TASKS: list[str] = []
 DEFAULT_LABELS = ['Perfect', 'Good', 'Recovery', 'Failure']
+DEFAULT_GARBAGE_DIR = '_garbage'   # below storage_path; _-prefixed, so no dataset lists it
 
 
 def load_collector_config(config_file: str) -> dict:
@@ -77,6 +79,12 @@ class EpisodeWriter:
         self.unlabeled_dir = self.dataset_root / '_unlabeled'
         self.tasks: list[str] = list(config.get('tasks') or DEFAULT_TASKS)
         self.labels: list[str] = list(config.get('labels') or DEFAULT_LABELS)
+        # Episodes with this label are filed below garbage_root (garbage_dir: relative to
+        # storage_path, or absolute) instead of dataset_root; unset: no garbage label.
+        self.garbage_label: str | None = config.get('garbage_label') or None
+        if self.garbage_label is not None and self.garbage_label not in self.labels:
+            raise ValueError(f'garbage_label {self.garbage_label!r} is not one of the labels {self.labels}.')
+        self.garbage_root = self.dataset_root / Path(config.get('garbage_dir') or DEFAULT_GARBAGE_DIR).expanduser()
 
         self.record_process = None
         self.episode_path: Path | None = None   # episode being recorded, or stopped and not yet labeled
@@ -92,6 +100,11 @@ class EpisodeWriter:
     @property
     def is_recording(self) -> bool:
         return self.record_process is not None
+
+    @property
+    def pending(self) -> bool:
+        """A stopped episode waits for finish() or discard()."""
+        return self.episode_path is not None and not self.is_recording
 
     # ---- cameras ---------------------------------------------------------------------------
 
@@ -161,7 +174,7 @@ class EpisodeWriter:
         self._unsubscribe()
         # Drain frames and kick off background encoding
         frames = self.image_buffer.drain()
-        self.logger.info(f'Encoding {len(frames)} frames to video...')
+        self.logger.info(f'Encoding the videos of {len(frames)} cameras...')
         if frames:
             self.encode_thread = self._encode_async(frames, self.episode_path)
         else:
@@ -172,8 +185,8 @@ class EpisodeWriter:
 
     def finish(self, task: str, label: str, extra_files: dict[str, dict] | None = None) -> Path:
         """Labels the stopped episode (mcap/lwk_metadata.yaml, plus extra_files: name -> dict
-        written as YAML next to it) and moves it to <storage_path>/<task><suffix> once its videos
-        are written. Returns the target folder."""
+        written as YAML next to it) and moves it to <storage_path>/<task><suffix> (garbage_label:
+        <garbage_dir>/<task><suffix>) once its videos are written. Returns the target folder."""
         episode_path, encode_thread = self._take_stopped()
         metadata_dir = episode_path / 'mcap'
         with open(metadata_dir / 'lwk_metadata.yaml', 'w') as f:
@@ -181,7 +194,8 @@ class EpisodeWriter:
         for name, content in (extra_files or {}).items():
             with open(metadata_dir / name, 'w') as f:
                 yaml.safe_dump(content, f, sort_keys=False, allow_unicode=True)
-        target = self.dataset_root / f'{task}{self.suffix}' / episode_path.name
+        root = self.garbage_root if label == self.garbage_label else self.dataset_root
+        target = root / f'{task}{self.suffix}' / episode_path.name
         threading.Thread(target=self._move_to_task_dir, args=(episode_path, encode_thread, target),
                          daemon=True).start()
         return target
@@ -228,7 +242,8 @@ class EpisodeWriter:
             return
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
-            episode_path.rename(target)
+            # A rename below storage_path; copied when garbage_dir is on another filesystem
+            shutil.move(str(episode_path), str(target))
             self.logger.info(f'Episode saved to {target}')
         except OSError as e:
             self.logger.error(f'Failed to move episode to {target} ({e}) — left in {episode_path}')

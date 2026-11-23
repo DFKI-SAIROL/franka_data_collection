@@ -9,6 +9,11 @@ labels:
   - Good
   - Recovery
   - Failure
+  - Garbage
+# Episodes labeled garbage_label land in <garbage_dir>/<task> instead (relative to storage_path,
+# or absolute): kept, but out of every dataset (Franka Studio lists no _-prefixed folder).
+garbage_label: Garbage
+garbage_dir: _garbage
 
 # Recorded once per spawned arm; "{arm}" is replaced by the arm namespace
 # (franka_left / franka_right), selected via the spawn_franka_* launch args.

@@ -3,13 +3,13 @@ from pathlib import Path
 
 import numpy as np
 
-from .image_buffer import CameraFrame
+from .image_buffer import CameraStream
 
 
 class VideoEncoder:
     """
-    Encodes a list of :class:`CameraFrame` objects into per-camera video files
-    and writes a ``timestamps.npy`` sidecar alongside them.
+    Encodes per-camera :class:`CameraStream` objects into video files
+    plus per-camera ``timestamps_<cam>.npy`` sidecars.
 
     Directory layout produced
     -------------------------
@@ -17,27 +17,33 @@ class VideoEncoder:
 
         <output_dir>/
             videos/
-                timestamps.npy          # int64 nanoseconds, shape (N,)
-                rgb_<camera_name>.mp4   # H.264 via ffmpeg
-                depth_<camera_name>.mkv # FFV1 lossless (when depth present)
+                rgb_<camera_name>.mp4         # H.264 via ffmpeg
+                timestamps_<camera_name>.npy  # int64 nanoseconds, shape (N,)
+
+    Per-camera timestamps make alignment a downstream concern: the dataset
+    builder pairs frames across cameras using these files.
 
     Parameters
     ----------
     camera_names:
-        Ordered list of camera names matching the order of the arrays inside
-        each :class:`CameraFrame`.
+        Ordered list of camera names.  One video file per name will be
+        written when that camera has frames.
     codec_config:
-        Dict with keys ``rgb`` (``"h264"``), ``depth`` (``"ffv1"``),
-        ``crf`` (int, H.264 quality — lower = better, 23 is a good default).
+        Dict with keys:
+          - ``rgb`` : ``"h264"``, ``"h265"``, or ``"h264_nvenc"``
+          - ``crf`` : H.264/H.265 quality (lower = better, 23 default)
+          - ``preset`` : ffmpeg preset, e.g. ``"veryfast"``, ``"medium"``
     fps:
-        Frame rate used for the container timestamps.  Does not affect the
-        per-frame ROS timestamps stored in ``timestamps.npy``.
+        Frame rate written into the video container.  Per-frame ROS
+        timestamps in ``timestamps_<cam>.npy`` are the source of truth
+        for actual timing — the container fps is approximate and only
+        affects playback in standard video players.
     """
 
-    # Supported RGB codecs and their ffmpeg parameters
     _RGB_CODEC_PARAMS: dict[str, list[str]] = {
-        "h264": ["-c:v", "libx264", "-pix_fmt", "yuv420p"],
-        "h265": ["-c:v", "libx265", "-pix_fmt", "yuv420p"],
+        "h264":       ["-c:v", "libx264",     "-pix_fmt", "yuv420p"],
+        "h265":       ["-c:v", "libx265",     "-pix_fmt", "yuv420p"],
+        "h264_nvenc": ["-c:v", "h264_nvenc",  "-pix_fmt", "yuv420p"],
     }
 
     def __init__(
@@ -50,8 +56,8 @@ class VideoEncoder:
         self.fps = fps
 
         self.rgb_codec: str = codec_config.get("rgb", "h264")
-        self.depth_codec: str = codec_config.get("depth", "ffv1")
         self.crf: int = int(codec_config.get("crf", 23))
+        self.preset: str = codec_config.get("preset", "medium")
 
         if self.rgb_codec not in self._RGB_CODEC_PARAMS:
             raise ValueError(
@@ -63,50 +69,46 @@ class VideoEncoder:
     # Public API
     # ------------------------------------------------------------------
 
-    def encode(self, frames: list[CameraFrame], output_dir: Path) -> None:
+    def encode(
+        self,
+        streams: dict[str, CameraStream],
+        output_dir: Path,
+    ) -> None:
         """
-        Encode *frames* and write all output files under *output_dir/videos/*.
+        Encode each camera's stream into its own mp4 + timestamps file.
 
         Parameters
         ----------
-        frames:
-            Ordered list of frames as returned by :meth:`ImageBuffer.drain`.
+        streams:
+            Mapping of camera name → :class:`CameraStream` as returned
+            by :meth:`ImageBuffer.drain`.
         output_dir:
             Episode root directory.  A ``videos/`` subdirectory is created.
         """
-        if not frames:
-            raise ValueError("Cannot encode an empty frame list.")
-
         video_dir = output_dir / "videos"
         video_dir.mkdir(parents=True, exist_ok=True)
 
-        # 1. Save timestamps
-        timestamps = np.array([f.timestamp_ns for f in frames], dtype=np.int64)
-        np.save(video_dir / "timestamps.npy", timestamps)
+        for cam_name in self.camera_names:
+            stream = streams.get(cam_name)
+            if stream is None or len(stream) == 0:
+                continue
 
-        has_depth = any(len(f.depths) > 0 for f in frames)
+            ts = np.asarray(stream.timestamps_ns, dtype=np.int64)
+            np.save(video_dir / f"timestamps_{cam_name}.npy", ts)
 
-        # 2. Encode per-camera RGB streams
-        for cam_idx, cam_name in enumerate(self.camera_names):
-            rgb_frames = [f.rgbs[cam_idx] for f in frames]
-            out_path = video_dir / f"rgb_{cam_name}.mp4"
-            self._encode_rgb(rgb_frames, out_path)
-
-        # 3. Encode per-camera depth streams (when present)
-        if has_depth:
-            for cam_idx, cam_name in enumerate(self.camera_names):
-                depth_frames = [f.depths[cam_idx] for f in frames if f.depths]
-                out_path = video_dir / f"depth_{cam_name}.mkv"
-                self._encode_depth(depth_frames, out_path)
+            self._encode_rgb(
+                stream.frames,
+                video_dir / f"rgb_{cam_name}.mp4",
+            )
 
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
 
     def _encode_rgb(self, frames: list[np.ndarray], out_path: Path) -> None:
-        """Encode a list of H×W×3 uint8 frames to H.264 mp4 via ffmpeg."""
+        """Encode H×W×3 uint8 BGR frames to video via ffmpeg."""
         if not frames:
-            raise ValueError(f"No RGB frames to encode for {out_path.name}.")
+            return
 
         h, w = frames[0].shape[:2]
         codec_params = self._RGB_CODEC_PARAMS[self.rgb_codec]
@@ -116,61 +118,29 @@ class VideoEncoder:
             "-f", "rawvideo",
             "-vcodec", "rawvideo",
             "-s", f"{w}x{h}",
-            "-pix_fmt", "bgr24",      # OpenCV default channel order
+            "-pix_fmt", "bgr24",
             "-r", str(self.fps),
             "-i", "pipe:0",
             *codec_params,
+            "-preset", self.preset,
             "-crf", str(self.crf),
             "-movflags", "+faststart",
             str(out_path),
         ]
 
-        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-        for frame in frames:
-            proc.stdin.write(frame.tobytes())
-        proc.stdin.close()
+        proc = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        try:
+            for frame in frames:
+                proc.stdin.write(frame.tobytes())
+        finally:
+            proc.stdin.close()
         proc.wait()
 
         if proc.returncode != 0:
             stderr = proc.stderr.read().decode(errors="replace")
             raise RuntimeError(
-                f"ffmpeg failed encoding {out_path.name} (rc={proc.returncode}):\n{stderr}"
-            )
-
-    def _encode_depth(self, frames: list[np.ndarray], out_path: Path) -> None:
-        """
-        Encode a list of H×W uint16 depth frames as FFV1 in an MKV container.
-
-        FFV1 is a lossless codec that natively handles 16-bit grayscale,
-        preserving the full depth range without any normalization.
-        """
-        if not frames:
-            raise ValueError(f"No depth frames to encode for {out_path.name}.")
-
-        h, w = frames[0].shape[:2]
-
-        cmd = [
-            "ffmpeg", "-y",
-            "-f", "rawvideo",
-            "-vcodec", "rawvideo",
-            "-s", f"{w}x{h}",
-            "-pix_fmt", "gray16le",   # 16-bit little-endian grayscale
-            "-r", str(self.fps),
-            "-i", "pipe:0",
-            "-c:v", "ffv1",
-            "-level", "3",            # FFV1 v3: supports multithreaded encoding
-            str(out_path),
-        ]
-
-        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-        for frame in frames:
-            # Ensure native byte order for ffmpeg
-            proc.stdin.write(frame.astype("<u2").tobytes())
-        proc.stdin.close()
-        proc.wait()
-
-        if proc.returncode != 0:
-            stderr = proc.stderr.read().decode(errors="replace")
-            raise RuntimeError(
-                f"ffmpeg failed encoding {out_path.name} (rc={proc.returncode}):\n{stderr}"
+                f"ffmpeg failed encoding {out_path.name} "
+                f"(rc={proc.returncode}):\n{stderr}"
             )

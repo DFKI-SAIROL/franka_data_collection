@@ -52,7 +52,9 @@ ros2 launch franka_data_collection start.launch.py
 ```
 
 > [!NOTE]
-> Pass `config_path:=/path/to/your.yaml` to override the default config.
+> Pass `config_path:=/path/to/your.yaml` to override the default config, and
+> `storage_path:=/path/to/datasets` to record somewhere other than the config's `storage_path`
+> (keeps machine-specific paths out of the shared config).
 
 ### 1.3.2. Start/Stop a Recording
 
@@ -61,6 +63,23 @@ Recording is toggled by calling the trigger service — the first call starts it
 ```bash
 ros2 service call /data_collector/record_data_trigger std_srvs/srv/Trigger
 ```
+
+Stopping opens a window to choose the episode's task and label. With `label_dialog:=false` the
+node runs headless, for a client that labels the episodes itself: the stopped episode waits
+for one of
+
+```bash
+# file it below storage_path/<task> (task may be nested, e.g. "<dataset>/<task>"); metadata is
+# an optional YAML mapping stored as mcap/episode_info.yaml
+ros2 service call /data_collector/finish_episode franka_custom_msgs/srv/FinishEpisode \
+  "{task: 'my_dataset/pick-cup', label: 'Good', metadata: 'operator: jane'}"
+ros2 service call /data_collector/discard_episode std_srvs/srv/Trigger
+```
+
+and a new recording is refused until then. The valid labels are the node's read-only `labels`
+parameter (from the config). An episode labeled `garbage_label` (`Garbage`) is filed below
+`garbage_dir` (default `<storage_path>/_garbage/<task>`) instead of `<storage_path>/<task>`: kept,
+but out of the datasets.
 
 ## 1.4. Output Layout
 

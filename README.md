@@ -52,7 +52,9 @@ ros2 launch franka_data_collection start.launch.py
 ```
 
 > [!NOTE]
-> Pass `config_path:=/path/to/your.yaml` to override the default config.
+> Pass `config_path:=/path/to/your.yaml` to override the default config, and
+> `storage_path:=/path/to/datasets` to record somewhere other than the config's `storage_path`
+> (keeps machine-specific paths out of the shared config).
 
 ### 1.3.2. Start/Stop a Recording
 

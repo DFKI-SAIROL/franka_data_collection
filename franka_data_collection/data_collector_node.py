@@ -52,6 +52,8 @@ class DataCollector(Node):
 
         self.declare_parameter('config_path', '')
         self.declare_parameter('arms', ['franka_right'])
+        # Dataset root for this machine; empty: the config's storage_path
+        self.declare_parameter('storage_path', '')
 
         config_file = self.get_parameter('config_path').get_parameter_value().string_value
         if not config_file or not os.path.isfile(config_file):
@@ -59,11 +61,15 @@ class DataCollector(Node):
             if config_file:
                 self.get_logger().warn(f'Config not found at {config_file}, falling back to {fallback}')
             config_file = fallback
+        config = load_collector_config(config_file)
+        storage_path = self.get_parameter('storage_path').get_parameter_value().string_value
+        if storage_path:
+            config['storage_path'] = storage_path
 
         # Bag, camera frames, labeling files and the move to the task folder: EpisodeWriter,
         # shared by every writer so they all produce the same layout.
         arms = list(self.get_parameter('arms').get_parameter_value().string_array_value)
-        self.writer = EpisodeWriter(self, load_collector_config(config_file), arms)
+        self.writer = EpisodeWriter(self, config, arms)
         self.get_logger().info(
             f'Recording to {self.writer.unlabeled_dir}; labeled episodes are moved to '
             f'{self.writer.dataset_root}/<task>'

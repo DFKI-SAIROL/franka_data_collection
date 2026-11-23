@@ -28,7 +28,8 @@ def generate_data_collector_node(context):
         name='data_collector',
         output='screen',
         parameters=[{'config_path': config_path, 'arms': arms,
-                     'label_dialog': LaunchConfiguration('label_dialog').perform(context).lower() == 'true'}],
+                     'label_dialog': LaunchConfiguration('label_dialog').perform(context).lower() == 'true',
+                     'storage_path': LaunchConfiguration('storage_path').perform(context)}],
     )]
 
 
@@ -62,6 +63,11 @@ def generate_launch_description():
             default_value="true",
             description="Open the labelling window after each episode; false: label through "
                         "~/finish_episode / ~/discard_episode (Franka Studio)",
+        ),
+        DeclareLaunchArgument(
+            "storage_path",
+            default_value="",
+            description="Dataset root on this machine; empty: the config's storage_path",
         ),
         OpaqueFunction(function=generate_data_collector_node),
     ])
